@@ -1,11 +1,15 @@
 """GT3BGMTool - manage the music in Gran Turismo 3.
 
-Open the game's song index (data/bgm/ads.inf) and you get the whole list: add your own songs, rename them,
-re-time their camera cuts, swap the audio under an existing entry, take a song back out, or export any song
-to a file you can listen to. Standard library only: no pip install.
+Two modes:
+  Race BGM   — data/bgm/ads.inf + .ads files (streamed PS-ADPCM, camera cuts)
+  Sequenced  — data/music/music.inf + music.seq + music.ins (menu / dealer music)
 
-Audio you bring in must already be a 16-bit 44.1 kHz stereo WAV - this tool converts the FORMAT (to the PS2's
+Standard library only: no pip install.
+
+Race BGM audio must already be a 16-bit 44.1 kHz stereo WAV - this tool converts the FORMAT (to the PS2's
 PS-ADPCM .ads), it does not resample or master for you. Cut points can come straight from an Audacity project.
+
+Sequenced mode can list tracks, export sequences as MIDI, and replace a sequence from a MIDI file.
 """
 
 from __future__ import annotations
@@ -21,6 +25,10 @@ from gt3bgm.audacity import Project
 from gt3bgm import psadpcm as ps
 from gt3bgm import export as ex
 from gt3bgm import verify as vfy
+from gt3bgm.mseq import Mseq, MseqSong
+from gt3bgm.seqg import SeqG, sequence_to_midi, midi_to_sequence, check_rebuild
+from gt3bgm.inst import Inst
+from gt3bgm.backup import backup_files
 
 APP = "GT3BGMTool"
 REMINDER = ("After copying the files into data/bgm/, run Options → \"Back to Default Settings\" once. "
@@ -257,6 +265,458 @@ class RetimeDialog(tk.Toplevel):
         self.destroy()
 
 
+class SeqMusicFrame(ttk.Frame):
+    """Tab for GT3 sequenced menu music (music.inf / music.seq / music.ins)."""
+
+    def __init__(self, master, log_fn):
+        super().__init__(master, padding=8)
+        self.log_fn = log_fn
+        self.mseq: Mseq | None = None
+        self.seqg: SeqG | None = None
+        self.inst: Inst | None = None
+        self.music_dir = ""
+        self.dirty = False
+        # GT2-style: list of (name, SeqG) and (name, Inst) when no music.inf pack is present
+        self.gt2_seqs: list[tuple[str, SeqG]] = []
+        self.gt2_insts: list[tuple[str, Inst]] = []
+        self.mode = "gt3"  # "gt3" or "gt2"
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(2, weight=1)
+
+        bar = ttk.Frame(self)
+        bar.grid(column=0, row=0, sticky="ew")
+        ttk.Button(bar, text="Open music folder…", command=self.open_folder).grid(column=0, row=0)
+        self.export_mid_btn = ttk.Button(bar, text="Export MIDI…", command=self.export_midi, state="disabled")
+        self.export_mid_btn.grid(column=1, row=0, padx=6)
+        self.export_all_btn = ttk.Button(bar, text="Export all MIDI…", command=self.export_all_midi, state="disabled")
+        self.export_all_btn.grid(column=2, row=0)
+        self.replace_btn = ttk.Button(bar, text="Replace sequence from MIDI…", command=self.replace_seq, state="disabled")
+        self.replace_btn.grid(column=3, row=0, padx=6)
+        self.save_btn = ttk.Button(bar, text="Save files…", command=self.save_files, state="disabled")
+        self.save_btn.grid(column=4, row=0)
+        self.extract_ins_btn = ttk.Button(bar, text="Extract instruments…", command=self.extract_instruments, state="disabled")
+        self.extract_ins_btn.grid(column=5, row=0, padx=6)
+        self.sf2_btn = ttk.Button(bar, text="Build SoundFont…", command=self.build_soundfont, state="disabled")
+        self.sf2_btn.grid(column=6, row=0)
+        self.backup_btn = ttk.Button(bar, text="Back up originals…", command=self.backup_originals, state="disabled")
+        self.backup_btn.grid(column=7, row=0, padx=6)
+        self.path_lbl = ttk.Label(bar, text="no folder open", foreground="#666")
+        self.path_lbl.grid(column=8, row=0, padx=12, sticky="w")
+
+        info = ttk.LabelFrame(self, text="Sequence set", padding=6)
+        info.grid(column=0, row=1, sticky="ew", pady=(8, 0))
+        self.info_lbl = ttk.Label(info, text="Open a GT3 music/ folder (music.inf+seq+ins).")
+        self.info_lbl.grid(column=0, row=0, sticky="w")
+
+        cols = ("idx", "name", "title", "artist", "seq", "bpm")
+        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=16, selectmode="browse")
+        for c, w, h in zip(cols, (40, 120, 120, 140, 50, 50),
+                           ("#", "Name", "Title", "Artist", "Seq", "BPM")):
+            self.tree.heading(c, text=h)
+            self.tree.column(c, width=w, anchor="w")
+        self.tree.grid(column=0, row=2, sticky="nsew", pady=(8, 0))
+        sb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        sb.grid(column=1, row=2, sticky="ns", pady=(8, 0))
+        self.tree.configure(yscrollcommand=sb.set)
+
+        hint = ttk.Label(self, text="GT3: music.inf + music.seq + music.ins.  "
+                         "GT2: any folder of .seq / .ins files (SEQG/INST).  "
+                         "Race BGM is on the other tab.",
+                         foreground="#666", wraplength=900)
+        hint.grid(column=0, row=3, sticky="w", pady=(8, 0))
+
+    def _set_btns(self, state: str):
+        for b in (self.export_mid_btn, self.export_all_btn, self.replace_btn,
+                  self.save_btn, self.extract_ins_btn, self.sf2_btn, self.backup_btn):
+            b.configure(state=state)
+
+    def open_folder(self):
+        d = filedialog.askdirectory(title="GT3 music/ folder, or GT2 folder of .seq/.ins files")
+        if not d:
+            return
+        inf_p = os.path.join(d, "music.inf")
+        seq_p = os.path.join(d, "music.seq")
+        ins_p = os.path.join(d, "music.ins")
+
+        # Prefer GT3 pack if present
+        if os.path.isfile(inf_p) and os.path.isfile(seq_p) and os.path.isfile(ins_p):
+            try:
+                mseq = Mseq.open(inf_p)
+                seqg = SeqG.open(seq_p)
+                inst = Inst.open(ins_p)
+            except Exception as e:
+                messagebox.showerror(APP, f"Could not read the GT3 music files:\n{e}")
+                return
+            self.mode = "gt3"
+            self.mseq, self.seqg, self.inst = mseq, seqg, inst
+            self.gt2_seqs, self.gt2_insts = [], []
+            self.music_dir = d
+            self.dirty = False
+            self.path_lbl.configure(text=d)
+            self.info_lbl.configure(
+                text=f"GT3 pack — {len(mseq.songs)} songs  ·  {seqg.sequence_count()} sequences  ·  "
+                     f"instrument bank {inst.size:,} bytes")
+            self._set_btns("normal")
+            self.refresh()
+            self.log_fn(f"Opened GT3 sequenced music in {d}")
+            return
+
+        # GT2 / loose files: any *.seq (SEQG) and *.ins (INST)
+        seq_files = sorted(
+            f for f in os.listdir(d)
+            if f.lower().endswith(".seq") and os.path.isfile(os.path.join(d, f)))
+        ins_files = sorted(
+            f for f in os.listdir(d)
+            if f.lower().endswith(".ins") and os.path.isfile(os.path.join(d, f)))
+
+        if not seq_files and not ins_files:
+            messagebox.showerror(
+                APP,
+                "This folder has neither a GT3 pack\n"
+                "  (music.inf + music.seq + music.ins)\n"
+                "nor any GT2-style .seq / .ins files.")
+            return
+
+        gt2_seqs: list[tuple[str, SeqG]] = []
+        errors = []
+        for name in seq_files:
+            try:
+                s = SeqG.open(os.path.join(d, name))
+                gt2_seqs.append((name, s))
+            except Exception as e:
+                errors.append(f"{name}: {e}")
+
+        gt2_insts: list[tuple[str, Inst]] = []
+        for name in ins_files:
+            try:
+                i = Inst.open(os.path.join(d, name))
+                gt2_insts.append((name, i))
+            except Exception as e:
+                errors.append(f"{name}: {e}")
+
+        if not gt2_seqs:
+            msg = "No readable SEQG (.seq) files found."
+            if errors:
+                msg += "\n\n" + "\n".join(errors[:8])
+            messagebox.showerror(APP, msg)
+            return
+
+        self.mode = "gt2"
+        self.mseq = None
+        # Build a synthetic multi-sequence SeqG view + fake Mseq list for the tree
+        self.gt2_seqs = gt2_seqs
+        self.gt2_insts = gt2_insts
+        self.seqg = self._gt2_as_seqg()
+        self.mseq = self._gt2_as_mseq()
+        self.inst = gt2_insts[0][1] if gt2_insts else Inst(raw=b"INST" + b"\0" * 12)
+        self.music_dir = d
+        self.dirty = False
+        self.path_lbl.configure(text=d)
+        ins_summary = ", ".join(n for n, _ in gt2_insts) if gt2_insts else "(none)"
+        self.info_lbl.configure(
+            text=f"GT2 / loose files — {len(gt2_seqs)} .seq  ·  {len(gt2_insts)} .ins  ({ins_summary})")
+        self._set_btns("normal")
+        # Replace is OK; save writes individual .seq files back
+        self.refresh()
+        self.log_fn(f"Opened GT2-style sequenced files in {d} "
+                    f"({len(gt2_seqs)} seq, {len(gt2_insts)} ins)")
+        if errors:
+            self.log_fn("Some files skipped: " + "; ".join(errors[:5]))
+
+    def _gt2_as_seqg(self) -> SeqG:
+        """Flatten each GT2 single-seq file into one combined SeqG for the UI."""
+        from gt3bgm.seqg import Sequence
+        combined = SeqG(sequences=[])
+        for name, sg in self.gt2_seqs:
+            if sg.sequences:
+                combined.sequences.append(sg.sequences[0])
+            else:
+                combined.sequences.append(Sequence())
+        return combined
+
+    def _gt2_as_mseq(self) -> Mseq:
+        """One synthetic song entry per GT2 .seq file."""
+        songs = []
+        for i, (name, sg) in enumerate(self.gt2_seqs):
+            stem = os.path.splitext(name)[0]
+            songs.append(MseqSong(
+                name=stem,
+                seq_file=name,
+                title=stem,
+                artist="",
+                seq_index=i,
+            ))
+        return Mseq(version=1, songs=songs)
+
+    def refresh(self):
+        self.tree.delete(*self.tree.get_children())
+        if not self.mseq or not self.seqg:
+            return
+        for i, s in enumerate(self.mseq.songs):
+            bpm = ""
+            if 0 <= s.seq_index < len(self.seqg.sequences):
+                bpm = f"{self.seqg.sequences[s.seq_index].bpm:.0f}"
+            self.tree.insert("", "end", iid=str(i), values=(
+                i, s.name, s.title, s.artist, s.seq_index, bpm))
+
+    def _selected_index(self) -> int | None:
+        sel = self.tree.selection()
+        if not sel:
+            return None
+        return int(sel[0])
+
+    def export_midi(self):
+        if not self.seqg or not self.mseq:
+            return
+        idx = self._selected_index()
+        if idx is None:
+            messagebox.showinfo(APP, "Select a song first.")
+            return
+        song = self.mseq.songs[idx]
+        seq_i = song.seq_index
+        if not 0 <= seq_i < len(self.seqg.sequences):
+            messagebox.showerror(APP, f"Song points at sequence {seq_i}, which does not exist.")
+            return
+        out = filedialog.asksaveasfilename(
+            title="Export sequence as MIDI",
+            defaultextension=".mid",
+            initialfile=f"{song.name}.mid",
+            filetypes=[("MIDI", "*.mid"), ("All", "*.*")])
+        if not out:
+            return
+        try:
+            sequence_to_midi(self.seqg.sequences[seq_i], out)
+        except Exception as e:
+            messagebox.showerror(APP, f"Export failed:\n{e}")
+            return
+        self.log_fn(f"Exported sequence {seq_i} ({song.name}) → {out}")
+        messagebox.showinfo(APP, f"Wrote {out}")
+
+    def export_all_midi(self):
+        if not self.seqg or not self.mseq:
+            return
+        out_dir = filedialog.askdirectory(title="Folder for MIDI files")
+        if not out_dir:
+            return
+        try:
+            for i, seq in enumerate(self.seqg.sequences):
+                name = f"seq{i:02d}"
+                for s in self.mseq.songs:
+                    if s.seq_index == i:
+                        name = s.name
+                        break
+                path = os.path.join(out_dir, f"{name}.mid")
+                sequence_to_midi(seq, path)
+                self.log_fn(f"  [{i}] {path}")
+        except Exception as e:
+            messagebox.showerror(APP, f"Export failed:\n{e}")
+            return
+        messagebox.showinfo(APP, f"Wrote {self.seqg.sequence_count()} MIDI files to\n{out_dir}")
+
+    def replace_seq(self):
+        if not self.seqg or not self.mseq:
+            return
+        idx = self._selected_index()
+        if idx is None:
+            messagebox.showinfo(APP, "Select a song first (its sequence will be replaced).")
+            return
+        song = self.mseq.songs[idx]
+        seq_i = song.seq_index
+        if not 0 <= seq_i < len(self.seqg.sequences):
+            messagebox.showerror(APP, f"Song points at sequence {seq_i}, which does not exist.")
+            return
+        mid = filedialog.askopenfilename(
+            title="MIDI file to use as the new sequence",
+            filetypes=[("MIDI", "*.mid *.midi"), ("All", "*.*")])
+        if not mid:
+            return
+        try:
+            old = self.seqg.sequences[seq_i]
+            new = midi_to_sequence(mid, master_volume=old.master_volume)
+            if new.tempo_ms == 500_000 and old.tempo_ms:
+                new.tempo_ms = old.tempo_ms
+            self.seqg.sequences[seq_i] = new
+            self.dirty = True
+            self.refresh()
+            active = sum(1 for t in new.tracks if t.events)
+            self.log_fn(f"Replaced sequence {seq_i} from {os.path.basename(mid)} "
+                        f"({new.bpm:.0f} BPM, {active} tracks). Click Save files to write it to a separate folder.")
+            messagebox.showinfo(APP, f"Sequence {seq_i} replaced.\n"
+                                     f"{new.bpm:.0f} BPM, {active} active tracks.\n\n"
+                                     "Click Save files… to write music.seq into a separate folder.")
+        except Exception as e:
+            messagebox.showerror(APP, f"Could not import that MIDI:\n{e}")
+
+    def build_soundfont(self):
+        """Build SF2 SoundFont file(s) from loaded .ins bank(s)."""
+        if not self.music_dir:
+            return
+        banks: list[tuple[str, Inst]] = []
+        if self.mode == "gt2":
+            banks = list(self.gt2_insts)
+        elif self.inst is not None:
+            banks = [("music.ins", self.inst)]
+        if not banks:
+            messagebox.showinfo(APP, "No instrument bank (.ins) is loaded.")
+            return
+
+        if len(banks) == 1:
+            default_name = os.path.splitext(banks[0][0])[0] + ".sf2"
+            out = filedialog.asksaveasfilename(
+                title="Save SoundFont",
+                defaultextension=".sf2",
+                initialfile=default_name,
+                filetypes=[("SoundFont", "*.sf2"), ("All", "*.*")])
+            if not out:
+                return
+            targets = [(banks[0][0], banks[0][1], out)]
+        else:
+            out_dir = filedialog.askdirectory(title="Folder for SoundFont files")
+            if not out_dir:
+                return
+            targets = [
+                (name, inst, os.path.join(out_dir, os.path.splitext(name)[0] + ".sf2"))
+                for name, inst in banks
+            ]
+
+        try:
+            for name, inst, path in targets:
+                if not inst.samples:
+                    inst = Inst.read(inst.raw)
+                inst.extract_sf2(path)
+                self.log_fn(f"SoundFont {len(inst.samples)} samples from {name} → {path}")
+        except Exception as e:
+            messagebox.showerror(APP, f"SoundFont build failed:\n{e}")
+            return
+
+        if len(targets) == 1:
+            messagebox.showinfo(APP, f"Wrote {targets[0][2]}\n\n"
+                                     f"{len(targets[0][1].samples)} presets (one per sample).\n"
+                                     "Program numbers = sample index. Load in a DAW or player "
+                                     "alongside the exported MIDI.")
+        else:
+            messagebox.showinfo(APP, f"Wrote {len(targets)} SoundFont files.\n"
+                                     "Each bank has one preset per sample.")
+
+    def extract_instruments(self):
+        """Decode SPU-ADPCM samples from .ins bank(s) to WAV + VAG."""
+        if not self.music_dir:
+            return
+        out_dir = filedialog.askdirectory(title="Folder for extracted instrument samples")
+        if not out_dir:
+            return
+
+        banks: list[tuple[str, Inst]] = []
+        if self.mode == "gt2":
+            banks = list(self.gt2_insts)
+        elif self.inst is not None:
+            banks = [("music.ins", self.inst)]
+
+        if not banks:
+            messagebox.showinfo(APP, "No instrument bank (.ins) is loaded.")
+            return
+
+        total_written = []
+        try:
+            for name, inst in banks:
+                # Re-parse to ensure samples are split (older loaded objects may lack them)
+                if not inst.samples:
+                    inst = Inst.read(inst.raw)
+                sub = os.path.join(out_dir, os.path.splitext(name)[0])
+                written = inst.extract_all(sub, also_vag=True)
+                total_written.extend(written)
+                self.log_fn(f"Extracted {len(inst.samples)} samples from {name} → {sub}")
+        except Exception as e:
+            messagebox.showerror(APP, f"Extraction failed:\n{e}")
+            return
+
+        n_wav = sum(1 for p in total_written if p.endswith(".wav"))
+        messagebox.showinfo(
+            APP,
+            f"Extracted {n_wav} samples (WAV + VAG) from {len(banks)} bank(s)\n"
+            f"into {out_dir}\n\n"
+            "Sample rate is assumed 22050 Hz (typical for SPU banks).\n"
+            "Program/note mapping is not yet included — these are the raw samples.")
+
+    def _original_file_names(self) -> list[str]:
+        """The files on disk that belong to the folder that is open."""
+        if self.mode == "gt2":
+            return [n for n, _ in self.gt2_seqs] + [n for n, _ in self.gt2_insts]
+        return ["music.inf", "music.seq", "music.ins"]
+
+    def backup_originals(self):
+        """Copy the original files into a new time-stamped folder. Nothing is changed or overwritten."""
+        if not self.music_dir:
+            return
+        dest_root = filedialog.askdirectory(
+            title="Put the backup into which folder? (a new dated folder is made inside it)")
+        if not dest_root:
+            return
+        try:
+            dest, names = backup_files(self.music_dir, self._original_file_names(), dest_root)
+        except Exception as e:
+            messagebox.showerror(APP, f"Backup failed:\n{e}")
+            return
+        self.log_fn(f"Backed up {len(names)} file(s) to {dest}")
+        messagebox.showinfo(APP, "Backed up and verified:\n  " + "\n  ".join(names) +
+                                 f"\n\ninto\n{dest}")
+
+    def save_files(self):
+        """Write the result into a folder of the user's choosing. The loaded files are never touched."""
+        if not self.seqg or not self.music_dir:
+            return
+        out = filedialog.askdirectory(
+            title="Save into which folder? (not the folder you opened - your originals stay as they are)")
+        if not out:
+            return
+        same = os.path.normcase(os.path.realpath(out)) == os.path.normcase(os.path.realpath(self.music_dir))
+        if same:
+            messagebox.showerror(APP, "That is the folder you opened.\n\nPick a different folder so your "
+                                      "original files are left alone.")
+            return
+        try:
+            # (name, bytes to write, original bytes, replaced sequence indices or None for a plain copy)
+            files: list[tuple[str, bytes, bytes, list[int] | None]] = []
+            if self.mode == "gt2":
+                for i, (name, sg) in enumerate(self.gt2_seqs):
+                    if not sg.sequences:
+                        continue                                    # unreadable file: nothing to write
+                    sg.sequences[0] = self.seqg.sequences[i]       # carries any replacement
+                    files.append((name, sg.write(), sg.raw, sg.replaced_indices()))
+                for name, inst in self.gt2_insts:
+                    files.append((name, inst.write(), inst.raw, None))
+            else:
+                files.append(("music.inf", self.mseq.raw, self.mseq.raw, None))
+                files.append(("music.seq", self.seqg.write(), self.seqg.raw, self.seqg.replaced_indices()))
+                files.append(("music.ins", self.inst.write(), self.inst.raw, None))
+
+            for name, data, original, replaced in files:
+                if replaced is None:
+                    problems = [] if data == original else ["this file was not meant to change but does"]
+                else:
+                    problems = check_rebuild(original, data, replaced)
+                if problems:
+                    raise ValueError(f"{name} did not rebuild cleanly, nothing was written:\n  "
+                                     + "\n  ".join(problems[:8]))
+            written = []
+            for name, data, original, replaced in files:
+                with open(os.path.join(out, name), "wb") as f:
+                    f.write(data)
+                if data == original:
+                    note = "identical to the original"
+                else:
+                    note = f"{len(replaced)} replaced"
+                written.append(f"{name} ({len(data)} B, {note})")
+        except Exception as e:
+            messagebox.showerror(APP, f"Could not write files:\n{e}")
+            return
+        self.dirty = False
+        self.log_fn("Saved to " + out + ": " + ", ".join(written))
+        messagebox.showinfo(APP, "Wrote:\n  " + "\n  ".join(written) + f"\n\ninto {out}\n\n"
+                                 "Copy them into the game's data/music/ folder to use them.")
+
+
 class App(ttk.Frame):
     def __init__(self, root: tk.Tk):
         super().__init__(root, padding=10)
@@ -265,7 +725,7 @@ class App(ttk.Frame):
         root.columnconfigure(0, weight=1)
         root.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(3, weight=1)
+        self.rowconfigure(0, weight=1)
 
         self.inf: AdsInf | None = None
         self.inf_path = ""
@@ -275,7 +735,16 @@ class App(ttk.Frame):
         self.changed: set[str] = set()          # existing songs the user edited on purpose
         self.removed: set[str] = set()          # entries taken out of the index
 
-        bar = ttk.Frame(self)
+        nb = ttk.Notebook(self)
+        nb.grid(column=0, row=0, sticky="nsew")
+
+        # --- Race BGM tab (existing UI) ---
+        race = ttk.Frame(nb, padding=4)
+        nb.add(race, text="Race BGM (ads.inf)")
+        race.columnconfigure(0, weight=1)
+        race.rowconfigure(3, weight=1)
+
+        bar = ttk.Frame(race)
         bar.grid(column=0, row=0, sticky="ew")
         ttk.Button(bar, text="Open ads.inf…", command=self.open_inf).grid(column=0, row=0)
         self.add_btn = ttk.Button(bar, text="Add new music…", command=self.add_music, state="disabled")
@@ -285,14 +754,14 @@ class App(ttk.Frame):
         self.path_lbl = ttk.Label(bar, text="no file open", foreground="#666")
         self.path_lbl.grid(column=3, row=0, padx=12, sticky="w")
 
-        sel = ttk.LabelFrame(self, text="Selected song", padding=6)
+        sel = ttk.LabelFrame(race, text="Selected song", padding=6)
         sel.grid(column=0, row=1, sticky="ew", pady=(8, 0))
         self.sel_btns = []
-        for i, (text, cmd) in enumerate((("Save audio as…", self.save_audio),
-                                         ("Replace audio…", self.replace_audio),
-                                         ("Re-time cuts…", self.retime),
-                                         ("Remove from list", self.remove_song))):
-            b = ttk.Button(sel, text=text, command=cmd, state="disabled")
+        for i, (label, cmd) in enumerate((("Save audio as…", self.save_audio),
+                                          ("Replace audio…", self.replace_audio),
+                                          ("Re-time cuts…", self.retime),
+                                          ("Remove from list", self.remove_song))):
+            b = ttk.Button(sel, text=label, command=cmd, state="disabled")
             b.grid(column=i, row=0, padx=(0, 6))
             self.sel_btns.append(b)
         self.e_title = tk.StringVar()
@@ -305,7 +774,7 @@ class App(ttk.Frame):
         self.rename_btn.grid(column=8, row=0, padx=6)
 
         cols = ("group", "name", "title", "artist", "length", "audio", "markers")
-        self.tree = ttk.Treeview(self, columns=cols, show="headings", height=15, selectmode="extended")
+        self.tree = ttk.Treeview(race, columns=cols, show="headings", height=15, selectmode="extended")
         for c, w in zip(cols, (46, 108, 215, 150, 62, 74, 200)):
             self.tree.heading(c, text=c.capitalize())
             self.tree.column(c, width=w, anchor="w")
@@ -314,17 +783,21 @@ class App(ttk.Frame):
         self.tree.tag_configure("edited", foreground="#c60")
         self.tree.tag_configure("missing", foreground="#b00")
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
-        sb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        sb = ttk.Scrollbar(race, orient="vertical", command=self.tree.yview)
         sb.grid(column=1, row=3, sticky="ns", pady=(8, 0))
         self.tree.configure(yscrollcommand=sb.set)
 
-        self.progress = ttk.Progressbar(self, mode="determinate")
+        self.progress = ttk.Progressbar(race, mode="determinate")
         self.progress.grid(column=0, row=4, sticky="ew", pady=(8, 0))
-        self.log = tk.Text(self, height=9, wrap="word")
+        self.log = tk.Text(race, height=9, wrap="word")
         self.log.grid(column=0, row=5, sticky="ew", pady=(8, 0))
         self.log.configure(state="disabled")
         self.say(f"{APP}. Open your game's data/bgm/ads.inf to begin.")
         self.say(REMINDER)
+
+        # --- Sequenced music tab ---
+        self.seq_frame = SeqMusicFrame(nb, log_fn=self.say)
+        nb.add(self.seq_frame, text="Sequenced music (music.inf)")
 
     def ui(self, fn, *args) -> None:
         """Tk may only be touched from the thread that owns it; the encoder runs on another one."""
