@@ -253,6 +253,30 @@ check([e[2] for e in r3.tracks[3].events if e[1] == sq.CMD_PROGRAM] == [5], "ins
 check(any(e[1] == sq.CMD_LOOP and e[2] == 0xFF for e in r3.tracks[3].events), "a loop marker survives MIDI export and import")
 check(any(e[1] == sq.CMD_LOOP for e in r3.tracks[9].events), "a track holding only a loop marker keeps it")
 
+# a MIDI track that never sends CC10 must still come out centred: GT3 does not default a track's pan to the
+# centre. PD sets program > volume > pan before the first note, so the added pan goes in that same place.
+e4 = sq.Sequence()
+t4 = sq.SeqTrack()
+t4.append(0, sq.CMD_PROGRAM, 3)
+t4.append(0, sq.CMD_VOLUME, 100)
+t4.append(0, "note", 60, 90, 20)
+t4.append(40, sq.CMD_END, 0, 0)
+e4.tracks[0] = t4
+t5 = sq.SeqTrack()
+t5.append(0, sq.CMD_PAN, 20)
+t5.append(0, "note", 64, 90, 20)
+t5.append(40, sq.CMD_END, 0, 0)
+e4.tracks[1] = t5
+mid4 = os.path.join(tmp, "nopan.mid")
+sq.sequence_to_midi(e4, mid4)
+r4 = sq.midi_to_sequence(mid4)
+k4 = [ev[1] for ev in r4.tracks[0].events if ev[0] == 0]
+check([ev[2] for ev in r4.tracks[0].events if ev[1] == sq.CMD_PAN] == [0x40]
+      and k4.index(sq.CMD_PROGRAM) < k4.index(sq.CMD_PAN) < k4.index("note"),
+      "a track without a pan gets a centre pan after program / volume, before its first note", str(k4))
+check([ev[2] for ev in r4.tracks[1].events if ev[1] == sq.CMD_PAN] == [20], "a pan the MIDI sets is kept, not doubled")
+check(not any(ev[1] == sq.CMD_PAN for ev in r3.tracks[9].events), "a track with no notes gets no pan")
+
 # an event that has no MIDI form must not disturb what follows it
 e2 = sq.Sequence()
 t2 = sq.SeqTrack()

@@ -696,6 +696,14 @@ def midi_to_sequence(path: str, master_volume: int = 0x4000) -> Sequence:
 
         gt.events.sort(key=lambda x: x[0])
 
+        # GT3's player does not centre a track that never sets its pan (it plays biased to the left), and most
+        # MIDI files only send CC10 when a pan control was moved. PD's own music.seq sets a pan on every track
+        # that has notes (72 of 72), always after program / volume and before the first note. So a track with
+        # notes but no pan at tick 0 gets a centre pan (0x40, PD's most used value) in that same place.
+        if any(ev[1] == "note" for ev in gt.events) and not any(ev[1] == CMD_PAN and ev[0] == 0 for ev in gt.events):
+            at = next((i for i, ev in enumerate(gt.events) if ev[0] > 0 or ev[1] == "note"), len(gt.events))
+            gt.events.insert(at, (0, CMD_PAN, 0x40))
+
     # One END tick for the whole sequence: prefer an explicit loopEnd marker, else just past the
     # last note. Original files always share this value across tracks.
     if loop_ends:
